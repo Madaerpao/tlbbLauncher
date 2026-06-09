@@ -5,6 +5,16 @@ import threading
 import subprocess
 import sys
 import time
+import os
+import json
+import signal
+
+try:
+    import tkinter as tk
+    from tkinter import filedialog, messagebox
+except ImportError:
+    # 即使在纯命令行环境没有 tkinter，如果只做 proxy 也能运行
+    pass
 
 def sock_close(conn):
     try:
@@ -12,30 +22,23 @@ def sock_close(conn):
     except:
         pass
 
-
 # 转发
 def transport(src, dst):
     try:
         recp = src.recv(1024)
-        sname = src.getsockname()[0]
-        dname = dst.getsockname()[0]
         while recp:
-            # print(f"[{sname} to {dname}]> " + recp.hex()) # 取消打印以免后台日志堆积
             dst.send(recp)
             recp = src.recv(1024)
     except:
         pass
-    # print(f'[{sname} to {dname}] End...')
     sock_close(src)
     sock_close(dst)
-
 
 # 侦听
 def accept_serv(remote_addr, sock_server):
     while True:
         try:
             conn, addr = sock_server.accept()
-            # print(f"Accept connection from {addr[0]}:{addr[1]}")
             tSock = socket.socket()
             tSock.connect(remote_addr)
             threading.Thread(target=transport, args=(conn, tSock)).start()
@@ -43,81 +46,272 @@ def accept_serv(remote_addr, sock_server):
         except Exception:
             pass
 
-
 def is_proxy_running(port):
     """检测本地指定端口是否已有代理在监听"""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.settimeout(0.5)
         return s.connect_ex(('127.0.0.1', port)) == 0
 
+# =========================================================================
+# 后台代理核心逻辑
+# =========================================================================
+def run_proxy(config):
+    try:
+        login_addr = (config['server_ip'], int(config['login_port']))
+        game_addr = (config['server_ip'], int(config['game_port']))
+        game_path = config['game_path']
+    except Exception as e:
+        sys.exit(1)
 
-if __name__ == '__main__':
-    # tlbb/server/config/serverinfo.ini [server1] port0
-    login_addr = ('ip of your game server', 0)
-    # tlbb/server/config/serverinfo.ini [server0] port0
-    game_addr = ('ip of your game server', 0)
-    game_path = r'游戏根目录'
+    socket2 = socket.socket(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP)
+    try:
+        socket2.bind(('127.0.0.1', game_addr[1]))
+        socket2.listen()
+        lip2, lport2 = socket2.getsockname()
+    except OSError:
+        # 代理已经被其他进程启动，安全退出
+        sys.exit(0)
 
-    # ---------------------------------------------------------
-    # 模式一：后台守护代理进程模式（完全不可见，只负责网络转发）
-    # ---------------------------------------------------------
-    if len(sys.argv) > 1 and sys.argv[1] == '--proxy':
-        socket2 = socket.socket(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP)
-        try:
-            socket2.bind(('127.0.0.1', game_addr[1]))
-            socket2.listen()
-            lip2, lport2 = socket2.getsockname()
-        except OSError:
-            # 代理已经被其他进程启动，安全退出
-            sys.exit(0)
+    # 记录代理的 PID，方便前端强杀
+    try:
+        with open("proxy.pid", "w") as f:
+            f.write(str(os.getpid()))
+    except:
+        pass
 
-        socket1 = socket.socket(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP)
-        socket1.bind(('127.0.0.1', 0))
-        socket1.listen()
-        lip1, lport1 = socket1.getsockname()
+    socket1 = socket.socket(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP)
+    socket1.bind(('127.0.0.1', 0))
+    socket1.listen()
+    lip1, lport1 = socket1.getsockname()
 
-        # 启动代理时重写配置文件，确保端口一致
-        with open(game_path + r"\Patch\LoginServer.txt", 'w') as file:
+    # 启动代理时重写配置文件，确保端口一致
+    try:
+        patch_file = game_path + r"\Patch\LoginServer.txt"
+        with open(patch_file, 'w') as file:
             text = "VERSION 1\n\nSERVER_BEGIN\n" + \
                    "我的天龙,我的天龙,1,201,3,1,0,天龙八部," + f"{lip1}:{lport1},"*4 + "2\nSERVER_END\n"
             file.write(text)
+    except Exception:
+        pass
 
-        # 阻塞并无限期提供转发服务
-        t_login = threading.Thread(target=accept_serv, args=(login_addr, socket1))
-        t_game = threading.Thread(target=accept_serv, args=(game_addr, socket2))
-        t_login.start()
-        t_game.start()
-        t_login.join()
-        t_game.join()
-        sys.exit(0)
-
-    # ---------------------------------------------------------
-    # 模式二：前端启动器模式（你每次运行的界面）
-    # ---------------------------------------------------------
-    # 1. 检查后台主代理进程是否存在
-    if not is_proxy_running(game_addr[1]):
-        print("未检测到后台代理，正在启动代理进程守护...")
-        # 分离出后台代理进程：忽略其输出，防止后台管道堵塞导致崩溃
-        subprocess.Popen(
-            [sys.executable, sys.argv[0], '--proxy'], 
-            start_new_session=True, 
-            stdout=subprocess.DEVNULL, 
-            stderr=subprocess.DEVNULL
-        )
-        
-        # 2. 等待后台代理成功绑定并准备就绪
-        print("等待后台代理就绪...")
-        timeout = 50 # 最多等待5秒 (50 * 0.1s)
-        while not is_proxy_running(game_addr[1]) and timeout > 0:
-            time.sleep(0.1)
-            timeout -= 1
-        
-        # 再稍等0.5秒，确保后台进程把 LoginServer.txt 彻底写入完毕
-        time.sleep(0.5)
-
-    print("代理就绪，正在启动游戏客户端...")
-    # 3. 直接启动游戏进程
-    subprocess.Popen(game_path + r"\Bin\Game.exe -fl C0A80108 3039 12D82B")
-    
-    # 4. 瞬间退出当前前端启动器窗口，不留下痕迹
+    # 阻塞并无限期提供转发服务
+    t_login = threading.Thread(target=accept_serv, args=(login_addr, socket1))
+    t_game = threading.Thread(target=accept_serv, args=(game_addr, socket2))
+    t_login.start()
+    t_game.start()
+    t_login.join()
+    t_game.join()
     sys.exit(0)
+
+# =========================================================================
+# 前端 GUI 应用类
+# =========================================================================
+class LauncherApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("天龙八部 多开启动器")
+        self.root.geometry("450x420")
+        self.root.resizable(False, False)
+        self.config_file = "launcher_config.json"
+        
+        self.config = {
+            "game_path": r"C:\TLBB",
+            "server_ip": "127.0.0.1",
+            "login_port": "3732",
+            "game_port": "3733",
+            "game_args": "-fl C0A80108 3039 12D82B"
+        }
+        self.load_config()
+        self.setup_ui()
+        self.update_status()
+
+    def load_config(self):
+        if os.path.exists(self.config_file):
+            try:
+                with open(self.config_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    self.config.update(data)
+            except Exception:
+                pass
+
+    def save_config(self):
+        self.config['game_path'] = self.path_var.get()
+        self.config['server_ip'] = self.ip_var.get()
+        self.config['login_port'] = self.login_port_var.get()
+        self.config['game_port'] = self.game_port_var.get()
+        self.config['game_args'] = self.args_var.get()
+        try:
+            with open(self.config_file, 'w', encoding='utf-8') as f:
+                json.dump(self.config, f, indent=4, ensure_ascii=False)
+        except Exception as e:
+            print("保存配置失败:", e)
+
+    def browse_path(self):
+        directory = filedialog.askdirectory()
+        if directory:
+            # 在 Mac 环境下尽量替换斜杠格式以兼容游戏
+            directory = directory.replace('/', '\\')
+            self.path_var.set(directory)
+
+    def setup_ui(self):
+        # 游戏目录
+        frame_path = tk.Frame(self.root)
+        frame_path.pack(pady=10, padx=20, fill='x')
+        tk.Label(frame_path, text="游戏根目录:").pack(anchor='w')
+        self.path_var = tk.StringVar(value=self.config['game_path'])
+        tk.Entry(frame_path, textvariable=self.path_var, width=38).pack(side='left')
+        tk.Button(frame_path, text="浏览", command=self.browse_path).pack(side='right')
+
+        # 服务器设置框架
+        frame_server = tk.LabelFrame(self.root, text="服务器设置")
+        frame_server.pack(pady=10, padx=20, fill='x')
+
+        # IP
+        frame_ip = tk.Frame(frame_server)
+        frame_ip.pack(pady=5, padx=10, fill='x')
+        tk.Label(frame_ip, text="服务器 IP :").pack(side='left')
+        self.ip_var = tk.StringVar(value=self.config['server_ip'])
+        tk.Entry(frame_ip, textvariable=self.ip_var, width=18).pack(side='left', padx=10)
+
+        # 端口
+        frame_port = tk.Frame(frame_server)
+        frame_port.pack(pady=5, padx=10, fill='x')
+        tk.Label(frame_port, text="登录端口:").pack(side='left')
+        self.login_port_var = tk.StringVar(value=self.config['login_port'])
+        tk.Entry(frame_port, textvariable=self.login_port_var, width=8).pack(side='left', padx=(5, 10))
+        
+        tk.Label(frame_port, text="游戏端口:").pack(side='left')
+        self.game_port_var = tk.StringVar(value=self.config['game_port'])
+        tk.Entry(frame_port, textvariable=self.game_port_var, width=8).pack(side='left', padx=5)
+
+        # 参数设置
+        frame_args = tk.Frame(self.root)
+        frame_args.pack(pady=5, padx=20, fill='x')
+        tk.Label(frame_args, text="启动参数:").pack(anchor='w')
+        self.args_var = tk.StringVar(value=self.config['game_args'])
+        tk.Entry(frame_args, textvariable=self.args_var, width=50).pack(side='left')
+
+        # 分割线
+        tk.Frame(self.root, height=1, bg="grey").pack(fill='x', padx=20, pady=10)
+
+        # 状态指示
+        self.status_var = tk.StringVar(value="后台代理状态: 检测中...")
+        self.status_label = tk.Label(self.root, textvariable=self.status_var, fg="blue", font=("Arial", 12, "bold"))
+        self.status_label.pack(pady=5)
+
+        # 操作按钮
+        frame_btns = tk.Frame(self.root)
+        frame_btns.pack(pady=10)
+        
+        btn_launch = tk.Button(frame_btns, text="🚀 启动游戏 (支持多开)", font=("Arial", 14, "bold"), bg="#4CAF50", fg="black", width=20, height=2, command=self.launch_game)
+        btn_launch.pack(pady=5)
+        
+        btn_kill = tk.Button(frame_btns, text="🛑 一键结束所有后台代理", font=("Arial", 10), fg="red", command=self.kill_proxy)
+        btn_kill.pack(pady=0)
+
+    def launch_game(self):
+        self.save_config()
+        try:
+            game_port = int(self.config['game_port'])
+        except ValueError:
+            messagebox.showerror("错误", "游戏端口必须是数字！")
+            return
+        
+        # 1. 检查后台主代理进程是否存在
+        if not is_proxy_running(game_port):
+            # 分离出后台代理进程：忽略其输出，防止后台管道堵塞导致崩溃
+            subprocess.Popen(
+                [sys.executable, sys.argv[0], '--proxy'], 
+                start_new_session=True, 
+                stdout=subprocess.DEVNULL, 
+                stderr=subprocess.DEVNULL
+            )
+            
+            # 等待后台代理成功绑定并准备就绪
+            timeout = 50 # 最多等待5秒
+            while not is_proxy_running(game_port) and timeout > 0:
+                time.sleep(0.1)
+                timeout -= 1
+                self.root.update()
+            
+            # 再稍等0.5秒，确保后台进程把 LoginServer.txt 彻底写入完毕
+            time.sleep(0.5)
+
+        # 2. 直接启动游戏进程
+        game_path = self.config['game_path']
+        args = self.config['game_args']
+        try:
+            # 兼容 Mac 的 Popen，采用 shell=True 以避免命令行解析错误
+            cmd = f'"{game_path}\\Bin\\Game.exe" {args}'
+            subprocess.Popen(cmd, shell=True)
+            self.update_status_display()
+        except Exception as e:
+            messagebox.showerror("启动失败", f"无法启动游戏，请检查目录是否正确。\n错误信息: {str(e)}")
+
+    def kill_proxy(self):
+        try:
+            if os.path.exists("proxy.pid"):
+                with open("proxy.pid", "r") as f:
+                    pid = int(f.read().strip())
+                # 尝试发送 SIGTERM
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except AttributeError:
+                    # Windows 下可能需要其他信号或直接忽略 AttributeError 尝试 signal 15
+                    os.kill(pid, 15)
+                os.remove("proxy.pid")
+                messagebox.showinfo("成功", "后台代理已发送终止信号！\n（若未立即生效，它将在连接断开时自然消亡）")
+            else:
+                messagebox.showwarning("提示", "未找到 proxy.pid 代理进程记录。")
+        except ProcessLookupError:
+            messagebox.showwarning("提示", "记录的代理进程已经不存在。")
+            if os.path.exists("proxy.pid"):
+                os.remove("proxy.pid")
+        except Exception as e:
+            messagebox.showerror("错误", f"结束进程时发生错误：{e}")
+        self.update_status_display()
+
+    def update_status_display(self):
+        try:
+            port = int(self.game_port_var.get())
+            if is_proxy_running(port):
+                self.status_var.set("后台代理状态: 🟢 运行中")
+                self.status_label.config(fg="green")
+            else:
+                self.status_var.set("后台代理状态: 🔴 未运行")
+                self.status_label.config(fg="red")
+        except Exception:
+            self.status_var.set("后台代理状态: ⚠️ 端口配置无效")
+            self.status_label.config(fg="orange")
+
+    def update_status(self):
+        self.update_status_display()
+        # 每隔2秒刷新一次状态
+        self.root.after(2000, self.update_status)
+
+# =========================================================================
+# 主程序入口
+# =========================================================================
+if __name__ == '__main__':
+    # 如果带有 --proxy 参数，则进入后台代理守护模式
+    if len(sys.argv) > 1 and sys.argv[1] == '--proxy':
+        # 加载配置
+        config = {
+            "game_path": r"C:\TLBB",
+            "server_ip": "127.0.0.1",
+            "login_port": "3732",
+            "game_port": "3733",
+            "game_args": "-fl C0A80108 3039 12D82B"
+        }
+        if os.path.exists("launcher_config.json"):
+            try:
+                with open("launcher_config.json", 'r', encoding='utf-8') as f:
+                    config.update(json.load(f))
+            except:
+                pass
+        run_proxy(config)
+    else:
+        # 进入 GUI 模式
+        root = tk.Tk()
+        app = LauncherApp(root)
+        root.mainloop()
