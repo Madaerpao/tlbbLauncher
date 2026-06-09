@@ -3,7 +3,8 @@
 import socket
 import threading
 import subprocess
-
+import sys
+import time
 
 def sock_close(conn):
     try:
@@ -19,12 +20,12 @@ def transport(src, dst):
         sname = src.getsockname()[0]
         dname = dst.getsockname()[0]
         while recp:
-            print(f"[{sname} to {dname}]> " + recp.hex())
+            # print(f"[{sname} to {dname}]> " + recp.hex()) # 取消打印以免后台日志堆积
             dst.send(recp)
             recp = src.recv(1024)
     except:
         pass
-    print(f'[{sname} to {dname}] End...')
+    # print(f'[{sname} to {dname}] End...')
     sock_close(src)
     sock_close(dst)
 
@@ -32,12 +33,22 @@ def transport(src, dst):
 # 侦听
 def accept_serv(remote_addr, sock_server):
     while True:
-        conn, addr = sock_server.accept()
-        print(f"Accept connection from {addr[0]}:{addr[1]}")
-        tSock = socket.socket()
-        tSock.connect(remote_addr)
-        threading.Thread(target=transport, args=(conn, tSock)).start()
-        threading.Thread(target=transport, args=(tSock, conn)).start()
+        try:
+            conn, addr = sock_server.accept()
+            # print(f"Accept connection from {addr[0]}:{addr[1]}")
+            tSock = socket.socket()
+            tSock.connect(remote_addr)
+            threading.Thread(target=transport, args=(conn, tSock)).start()
+            threading.Thread(target=transport, args=(tSock, conn)).start()
+        except Exception:
+            pass
+
+
+def is_proxy_running(port):
+    """检测本地指定端口是否已有代理在监听"""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(0.5)
+        return s.connect_ex(('127.0.0.1', port)) == 0
 
 
 if __name__ == '__main__':
@@ -47,28 +58,66 @@ if __name__ == '__main__':
     game_addr = ('ip of your game server', 0)
     game_path = r'游戏根目录'
 
-    # 设置两个监听
-    socket1 = socket.socket(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP)
-    socket1.bind(('127.0.0.1', 0))
-    socket1.listen()
-    lip1, lport1 = socket1.getsockname()
+    # ---------------------------------------------------------
+    # 模式一：后台守护代理进程模式（完全不可见，只负责网络转发）
+    # ---------------------------------------------------------
+    if len(sys.argv) > 1 and sys.argv[1] == '--proxy':
+        socket2 = socket.socket(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP)
+        try:
+            socket2.bind(('127.0.0.1', game_addr[1]))
+            socket2.listen()
+            lip2, lport2 = socket2.getsockname()
+        except OSError:
+            # 代理已经被其他进程启动，安全退出
+            sys.exit(0)
 
-    socket2 = socket.socket(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP)
-    socket2.bind(('127.0.0.1', game_addr[1]))
-    socket2.listen()
-    lip2, lport2 = socket2.getsockname()
+        socket1 = socket.socket(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP)
+        socket1.bind(('127.0.0.1', 0))
+        socket1.listen()
+        lip1, lport1 = socket1.getsockname()
 
-    # 启动程序
-    with open(game_path + r"\Patch\LoginServer.txt", 'w') as file:
-        text = "VERSION 1\n\nSERVER_BEGIN\n" + \
-               "我的天龙,我的天龙,1,201,3,1,0,天龙八部," + f"{lip1}:{lport1},"*4 + "2\nSERVER_END\n"
-        file.write(text)
+        # 启动代理时重写配置文件，确保端口一致
+        with open(game_path + r"\Patch\LoginServer.txt", 'w') as file:
+            text = "VERSION 1\n\nSERVER_BEGIN\n" + \
+                   "我的天龙,我的天龙,1,201,3,1,0,天龙八部," + f"{lip1}:{lport1},"*4 + "2\nSERVER_END\n"
+            file.write(text)
+
+        # 阻塞并无限期提供转发服务
+        t_login = threading.Thread(target=accept_serv, args=(login_addr, socket1))
+        t_game = threading.Thread(target=accept_serv, args=(game_addr, socket2))
+        t_login.start()
+        t_game.start()
+        t_login.join()
+        t_game.join()
+        sys.exit(0)
+
+    # ---------------------------------------------------------
+    # 模式二：前端启动器模式（你每次运行的界面）
+    # ---------------------------------------------------------
+    # 1. 检查后台主代理进程是否存在
+    if not is_proxy_running(game_addr[1]):
+        print("未检测到后台代理，正在启动代理进程守护...")
+        # 分离出后台代理进程：忽略其输出，防止后台管道堵塞导致崩溃
+        subprocess.Popen(
+            [sys.executable, sys.argv[0], '--proxy'], 
+            start_new_session=True, 
+            stdout=subprocess.DEVNULL, 
+            stderr=subprocess.DEVNULL
+        )
+        
+        # 2. 等待后台代理成功绑定并准备就绪
+        print("等待后台代理就绪...")
+        timeout = 50 # 最多等待5秒 (50 * 0.1s)
+        while not is_proxy_running(game_addr[1]) and timeout > 0:
+            time.sleep(0.1)
+            timeout -= 1
+        
+        # 再稍等0.5秒，确保后台进程把 LoginServer.txt 彻底写入完毕
+        time.sleep(0.5)
+
+    print("代理就绪，正在启动游戏客户端...")
+    # 3. 直接启动游戏进程
     subprocess.Popen(game_path + r"\Bin\Game.exe -fl C0A80108 3039 12D82B")
-    # 开始侦听
-    t_login = threading.Thread(target=accept_serv, args=(login_addr, socket1))
-    t_game = threading.Thread(target=accept_serv, args=(game_addr, socket2))
-    t_login.start()
-    t_game.start()
-    t_login.join()
-    t_game.join()
-    print("End of Program")
+    
+    # 4. 瞬间退出当前前端启动器窗口，不留下痕迹
+    sys.exit(0)
